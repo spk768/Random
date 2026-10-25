@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packlauncher"
+version = "0.1.0"
+description = "Launcher de Minecraft focado em modpacks (Modrinth / .mrpack)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+packlauncher = "packlauncher.cli:main"
+
+[tool.setuptools]
+packages = ["packlauncher"]
