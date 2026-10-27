@@ -15,6 +15,10 @@ DEFAULTS = {
     # Caminhos de Java por versão principal, ex.: {"17": "/usr/bin/java"}
     "java_paths": {},
     "auto_download_java": True,
+    # Chave da API do CurseForge (https://console.curseforge.com) e URL base da API.
+    # A URL pode apontar para um proxy compatível; nesse caso a chave é opcional.
+    "curseforge_api_key": "",
+    "curseforge_api_url": "https://api.curseforge.com",
 }
 
 
@@ -26,6 +30,8 @@ def load() -> dict:
         pass
     if os.environ.get("PACKLAUNCHER_MSA_CLIENT_ID"):
         data["msa_client_id"] = os.environ["PACKLAUNCHER_MSA_CLIENT_ID"]
+    if os.environ.get("CURSEFORGE_API_KEY"):
+        data["curseforge_api_key"] = os.environ["CURSEFORGE_API_KEY"]
     return data
 
 

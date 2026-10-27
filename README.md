@@ -18,7 +18,7 @@ uma CLI completa.
 
 ## Recursos
 
-- **Modpacks do Modrinth**: busca com filtro de versão/loader, escolha de versão,
+- **Modpacks do Modrinth e do CurseForge**: busca com filtro de versão/loader, escolha de versão,
   instalação em uma instância isolada.
 - **Importar `.mrpack`** de arquivo local, respeitando a especificação do formato:
   arquivos `client: unsupported` são ignorados, opcionais podem ser pulados,
@@ -118,6 +118,22 @@ embutido:
 Contas offline funcionam sem isso (servidores em modo offline / LAN / singleplayer).
 Os tokens ficam em `accounts.json` na pasta de dados (permissão 600 em Linux/macOS).
 
+## CurseForge
+
+Modpacks e mods do CurseForge são suportados (busca, instalação, atualização,
+importação de `.zip` exportado pelo app do CurseForge). A API do CurseForge exige
+uma chave:
+
+1. Crie uma chave em <https://console.curseforge.com>.
+2. Na interface: **Configurações → CurseForge → Chave da API**
+   (ou `packlauncher config curseforge_api_key <chave>`, ou a variável `CURSEFORGE_API_KEY`).
+
+O campo **URL da API do CurseForge** permite usar uma API customizada (um proxy
+compatível com a API oficial, `/v1/...`). Com uma URL customizada a chave é opcional.
+
+Na CLI: `packlauncher search create --cf`, `packlauncher install cf:<id>`,
+`packlauncher install ./pack.zip`.
+
 ## Onde ficam os arquivos
 
 | Sistema | Pasta |
@@ -134,8 +150,9 @@ Pode ser alterada com a variável `PACKLAUNCHER_HOME`. Cada instância fica em
 - Forge/NeoForge são instalados executando o instalador oficial em modo headless
   (`--installClient`), o que funciona com as versões modernas (1.13+). Versões muito
   antigas do Forge podem não suportar isso.
-- Modpacks do CurseForge não são suportados (a API exige chave); use a versão
-  Modrinth do pack ou exporte-o para `.mrpack`.
+- Alguns mods do CurseForge não permitem download por launchers. O launcher tenta
+  a CDN pública e, se não conseguir, lista esses arquivos na página da instância
+  com o link para baixar manualmente.
 
 ## Testes
 

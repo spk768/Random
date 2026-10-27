@@ -101,7 +101,7 @@ const S = {
   detail: null,
   sidebarFilter: "",
   tasks: {},
-  explore: { q: "", mc: "", loader: "", type: "modpack", target: null, hits: [], total: 0, offset: 0, loading: false, seq: 0 },
+  explore: { source: localStorage.getItem("source") || "modrinth", q: "", mc: "", loader: "", type: "modpack", target: null, hits: [], total: 0, offset: 0, loading: false, seq: 0 },
   mcVersions: null,
 };
 const LOADER_LABEL = { vanilla: "Vanilla", fabric: "Fabric", quilt: "Quilt", forge: "Forge", neoforge: "NeoForge" };
@@ -145,6 +145,7 @@ function go(view, opts = {}) {
     const target = opts.target ? inst(opts.target) : null;
     ex.target = target ? target.id : null;
     ex.type = target ? (opts.type || "mod") : "modpack";
+    if (target && target.pack.source === "curseforge") ex.source = "curseforge";
     if (target) { ex.mc = target.minecraft; ex.loader = target.loader === "vanilla" ? "" : target.loader; }
     else if (opts.reset !== false) { ex.mc = ""; ex.loader = ""; }
     renderChrome();
@@ -304,7 +305,13 @@ function viewInstance() {
 }
 
 function tabOverview(i, d) {
-  const pack = i.pack.source === "modrinth" ? `
+  const cf = i.pack.source === "curseforge";
+  const missing = (i.pack.missing || []).length ? `<div class="panel" style="margin-top:10px;border-color:rgba(245,158,11,.5)">
+      <b style="color:var(--yellow)">${i.pack.missing.length} arquivo(s) precisam ser baixados manualmente</b>
+      <div class="faint" style="margin:4px 0 8px">O autor desses mods não permite download por launchers. Baixe-os no CurseForge e coloque na pasta mods.</div>
+      ${i.pack.missing.map((m) => `<div style="display:flex;gap:8px;align-items:center;padding:3px 0"><span style="flex:1">${esc(m.name)} <span class="faint">${esc(m.file || "")}</span></span>${m.url ? `<button class="btn ghost" data-act="open-url" data-url="${esc(m.url)}">${I.external} Abrir</button>` : ""}</div>`).join("")}
+      <button class="btn" style="margin-top:8px" data-act="open-folder" data-id="${esc(i.id)}" data-sub="mods">${I.folder} Abrir pasta mods</button></div>` : "";
+  const pack = (i.pack.source === "modrinth" || cf) ? `
     <h2 class="section">Modpack</h2>
     <div class="panel"><div class="panel-row">
       ${art(i.pack.title || i.name, i.pack.icon_url)}
@@ -313,10 +320,10 @@ function tabOverview(i, d) {
         <div class="muted">Versão instalada: <b>${esc(i.pack.version_number || "?")}</b></div>
         <div class="faint" id="update-status"></div>
       </div>
-      <button class="btn ghost" data-act="open-url" data-url="https://modrinth.com/modpack/${esc(i.pack.slug || i.pack.project_id)}">${I.external} Modrinth</button>
+      <button class="btn ghost" data-act="open-url" data-url="${esc(cf ? (i.pack.url || "https://www.curseforge.com/minecraft/modpacks/" + (i.pack.slug || "")) : "https://modrinth.com/modpack/" + (i.pack.slug || i.pack.project_id))}">${I.external} ${cf ? "CurseForge" : "Modrinth"}</button>
       <button class="btn" data-act="check-update" data-id="${esc(i.id)}">${I.refresh} Verificar atualização</button>
-    </div></div>` : i.pack.source === "file" ? `
-    <h2 class="section">Modpack</h2><div class="panel muted">Importado de arquivo .mrpack${i.pack.title ? ` — <b>${esc(i.pack.title)}</b> ${esc(i.pack.version_number || "")}` : ""}.</div>` : "";
+    </div></div>${missing}` : i.pack.source === "file" ? `
+    <h2 class="section">Modpack</h2><div class="panel muted">Importado de arquivo ${i.pack.format === "curseforge" ? ".zip do CurseForge" : ".mrpack"}${i.pack.title ? ` — <b>${esc(i.pack.title)}</b> ${esc(i.pack.version_number || "")}` : ""}.</div>${missing}` : "";
   const folders = [["", "Pasta do jogo"], ["mods", "Mods"], ["config", "Config"], ["saves", "Mundos"], ["resourcepacks", "Resource packs"], ["shaderpacks", "Shaders"], ["screenshots", "Screenshots"]];
   return `<div class="stats">
       <div class="stat"><div class="label">Tempo de jogo</div><div class="value">${fmtPlaytime(i.playtime)}</div></div>
@@ -396,17 +403,18 @@ function viewExplore() {
   return `<div class="page">
     ${target ? `<div class="target-banner">${art(target.name, target.pack.icon_url)}<div class="grow">Adicionando conteúdo a <b>${esc(target.name)}</b> <span class="faint">(${esc(target.minecraft)} · ${esc(target.loader_label)})</span></div>
       <button class="btn" data-act="open-instance" data-id="${esc(target.id)}">Voltar à instância</button></div>` : ""}
-    <div class="page-head"><h1>${target ? "Explorar " + TYPE_LABEL[ex.type].toLowerCase() : "Explorar modpacks"}</h1></div>
+    <div class="page-head"><h1>${target ? "Explorar " + TYPE_LABEL[ex.type].toLowerCase() : "Explorar modpacks"}</h1><div class="grow"></div>
+      <div class="seg" style="margin:0;width:280px">${[["modrinth", "Modrinth"], ["curseforge", "CurseForge"]].map(([k, l]) => `<button class="${ex.source === k ? "active" : ""}" data-act="explore-source" data-source="${k}">${l}</button>`).join("")}</div></div>
     ${target ? `<div class="seg" style="max-width:520px">${["mod", "resourcepack", "shader"].map((t) => `<button class="${ex.type === t ? "active" : ""}" data-act="explore-type" data-type="${t}">${TYPE_LABEL[t]}</button>`).join("")}</div>` : ""}
     <div class="filters">
-      <label class="search big"><span class="search-icon">${I.search}</span><input id="explore-q" placeholder="Buscar ${TYPE_LABEL[ex.type].toLowerCase()} no Modrinth..." value="${esc(ex.q)}" autofocus></label>
+      <label class="search big"><span class="search-icon">${I.search}</span><input id="explore-q" placeholder="Buscar ${TYPE_LABEL[ex.type].toLowerCase()} no ${ex.source === "curseforge" ? "CurseForge" : "Modrinth"}..." value="${esc(ex.q)}" autofocus></label>
       <select class="input" id="explore-mc" ${target ? "disabled" : ""}><option value="">Todas as versões</option>
         ${(ex.mc && !versions.includes(ex.mc) ? [ex.mc] : []).concat(versions).map((v) => `<option ${v === ex.mc ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>
       <select class="input" id="explore-loader" ${target && ex.type === "mod" ? "disabled" : ""}>${loaders.map((l) => `<option value="${l}" ${l === ex.loader ? "selected" : ""}>${l ? LOADER_LABEL[l] : "Todos os loaders"}</option>`).join("")}</select>
     </div>
     <div class="faint" style="margin:-6px 0 12px">${ex.loading && !ex.hits.length ? "Buscando..." : `${fmtNum(ex.total)} resultados`}</div>
     <div class="results">${results}${skeletons}</div>
-    ${ex.error ? `<div class="empty"><h2>Não foi possível buscar</h2><div>${esc(ex.error)}</div><button class="btn" data-act="retry-search">${I.refresh} Tentar novamente</button></div>` : ""}
+    ${ex.error ? `<div class="empty"><h2>Não foi possível buscar</h2><div>${esc(ex.error)}</div><button class="btn" data-act="retry-search">${I.refresh} Tentar novamente</button>${ex.source === "curseforge" ? `<button class="btn primary" data-act="open-settings">${I.gear} Configurar API do CurseForge</button>` : ""}</div>` : ""}
     ${!ex.loading && !ex.error && !ex.hits.length ? `<div class="empty"><h2>Nada encontrado</h2><div>Tente outros termos ou remova os filtros.</div></div>` : ""}
     ${ex.hits.length < ex.total ? `<div class="load-more"><button class="btn" data-act="load-more" ${ex.loading ? "disabled" : ""}>${ex.loading ? '<span class="spin"></span>' : "Carregar mais"}</button></div>` : ""}
   </div>`;
@@ -443,7 +451,7 @@ async function search(reset) {
   ex.error = null;
   const seq = ++ex.seq;
   renderView();
-  const params = new URLSearchParams({ q: ex.q, type: ex.type, mc: ex.mc, loader: ex.type === "modpack" || ex.type === "mod" ? ex.loader : "", offset: ex.offset, limit: 24 });
+  const params = new URLSearchParams({ source: ex.source, q: ex.q, type: ex.type, mc: ex.mc, loader: ex.type === "modpack" || ex.type === "mod" ? ex.loader : "", offset: ex.offset, limit: 24 });
   try {
     const res = await api(`/api/search?${params}`);
     if (seq !== ex.seq) return;
@@ -518,7 +526,7 @@ function promptDialog(title, label, value = "") {
 async function addInstanceModal(tab = "custom") {
   const m = modal(`${head("Adicionar instância")}
     <div class="modal-body">
-      <div class="seg"><button data-tab="custom">Personalizada</button><button data-tab="import">Importar .mrpack</button><button data-tab="explore">Modpack do Modrinth</button></div>
+      <div class="seg"><button data-tab="custom">Personalizada</button><button data-tab="import">Importar arquivo</button><button data-tab="explore">Modrinth / CurseForge</button></div>
       <div id="tab-custom">
         <div class="form">
           <div class="field"><label>Nome</label><input class="input" id="ni-name" value="Nova instância"></div>
@@ -530,7 +538,7 @@ async function addInstanceModal(tab = "custom") {
         </div>
       </div>
       <div id="tab-import" hidden>
-        <label class="dropzone" id="dz">${I.upload.replace("<svg", '<svg style="width:40px;height:40px"')}<div style="margin-top:8px;font-weight:600">Arraste um arquivo .mrpack aqui</div><div class="faint">ou clique para escolher</div>
+        <label class="dropzone" id="dz">${I.upload.replace("<svg", '<svg style="width:40px;height:40px"')}<div style="margin-top:8px;font-weight:600">Arraste um .mrpack (Modrinth) ou .zip (CurseForge) aqui</div><div class="faint">ou clique para escolher</div>
           <input type="file" accept=".mrpack,.zip" hidden id="ni-file"></label>
         <div class="faint" style="margin-top:10px">Dica: você também pode arrastar um .mrpack para qualquer lugar da janela.</div>
       </div>
@@ -596,7 +604,7 @@ async function addInstanceModal(tab = "custom") {
 }
 
 async function importFile(f) {
-  if (!/\.(mrpack|zip)$/i.test(f.name)) return toast("Selecione um arquivo .mrpack", "error");
+  if (!/\.(mrpack|zip)$/i.test(f.name)) return toast("Selecione um .mrpack (Modrinth) ou .zip (CurseForge)", "error");
   try {
     const buf = await f.arrayBuffer();
     await api("/api/import", { method: "POST", raw: buf, headers: { "X-Filename": encodeURIComponent(f.name), "Content-Type": "application/octet-stream" } });
@@ -623,7 +631,7 @@ async function projectModal(pid) {
       </div>
     </div>
     <div class="modal-foot">
-      <button class="btn ghost" data-act="open-url" data-url="https://modrinth.com/${esc(hit.project_type || "project")}/${esc(hit.slug || pid)}">${I.external} Ver no Modrinth</button>
+      <button class="btn ghost" data-act="open-url" data-url="${esc(hit.url || `https://modrinth.com/${hit.project_type || "project"}/${hit.slug || pid}`)}">${I.external} Ver no ${hit.source === "curseforge" ? "CurseForge" : "Modrinth"}</button>
       <div style="flex:1"></div>
       <button class="btn" data-close>Cancelar</button>
       <button class="btn primary" id="pm-install" disabled>${I.download} ${target ? "Adicionar à instância" : "Instalar"}</button>
@@ -752,6 +760,11 @@ async function settingsModal() {
         ${["8", "17", "21"].map((v) => `<div class="row2" style="grid-template-columns:70px 1fr;margin-bottom:6px;align-items:center"><span class="muted">Java ${v}</span><input class="input" list="java-list" name="java_${v}" value="${esc((s.java_paths || {})[v] || "")}" placeholder="Automático"></div>`).join("")}</div>
       <div class="field"><label>Client ID do Azure (login Microsoft)</label><input class="input" name="msa_client_id" value="${esc(s.msa_client_id || "")}" placeholder="00000000-0000-0000-0000-000000000000">
         <div class="hint">Necessário para contas Microsoft. Veja o README para criar um.</div></div>
+      <h2 class="section" style="margin:6px 0 0">CurseForge</h2>
+      <div class="field"><label>Chave da API do CurseForge</label><input class="input" type="password" name="curseforge_api_key" value="${esc(s.curseforge_api_key || "")}" placeholder="$2a$10$..." autocomplete="off">
+        <div class="hint">Crie uma em <a href="#" data-act="open-url" data-url="https://console.curseforge.com/">console.curseforge.com</a>. Necessária para a API oficial.</div></div>
+      <div class="field"><label>URL da API do CurseForge</label><input class="input" name="curseforge_api_url" value="${esc(s.curseforge_api_url || "https://api.curseforge.com")}" placeholder="https://api.curseforge.com">
+        <div class="hint">Use uma URL customizada para apontar para um proxy compatível com a API oficial (a chave pode ser opcional nesse caso).</div></div>
       <div class="field"><label>Pasta de dados</label><div class="row2" style="grid-template-columns:1fr auto"><input class="input" value="${esc(S.data.data_dir)}" readonly><button type="button" class="btn" data-act="open-data-dir">${I.folder}</button></div></div>
     </form>
     <div class="modal-foot"><span class="faint" style="margin-right:auto;align-self:center">PackLauncher ${esc(S.data.version)}</span><button class="btn" data-close>Cancelar</button><button class="btn primary" id="set-save">Salvar</button></div>`);
@@ -766,6 +779,7 @@ async function settingsModal() {
     const body = {
       default_memory_mb: +fd.get("default_memory_mb"), download_workers: +fd.get("download_workers"),
       auto_download_java: f.auto_download_java.checked, msa_client_id: fd.get("msa_client_id"),
+      curseforge_api_key: fd.get("curseforge_api_key"), curseforge_api_url: fd.get("curseforge_api_url"),
       java_paths: { 8: fd.get("java_8"), 17: fd.get("java_17"), 21: fd.get("java_21") },
     };
     try { await api("/api/settings", { method: "POST", body }); m.close(); toast("Configurações salvas", "success"); }
@@ -795,7 +809,7 @@ function instanceMenu(anchor, id) {
   menu(anchor, [
     { label: "Abrir pasta", icon: I.folder, run: () => act["open-folder"]({ dataset: { id } }) },
     { label: "Adicionar mods", icon: I.plus, run: () => go("explore", { target: id, type: "mod" }) },
-    i.pack.source === "modrinth" ? { label: "Verificar atualização", icon: I.refresh, run: () => checkUpdate(id) } : null,
+    i.pack.source === "modrinth" || i.pack.source === "curseforge" ? { label: "Verificar atualização", icon: I.refresh, run: () => checkUpdate(id) } : null,
     { label: "Duplicar", icon: I.copy, run: async () => { try { const r = await api(`/api/instances/${id}/duplicate`, { method: "POST" }); await refresh(); go("instance", { id: r.id }); } catch (e) { fail(e); } } },
     { label: "Exportar .mrpack", icon: I.upload, run: async () => {
       const v = await promptDialog("Exportar modpack", "Versão do modpack", i.pack.version_number || "1.0.0");
@@ -851,6 +865,8 @@ const act = {
   "check-update": (el) => checkUpdate(el.dataset.id),
   "browse-for": (el) => go("explore", { target: el.dataset.id, type: el.dataset.type }),
   "explore-type": (el) => { S.explore.type = el.dataset.type; search(true); },
+  "explore-source": (el) => { S.explore.source = el.dataset.source; try { localStorage.setItem("source", el.dataset.source); } catch {} search(true); },
+  "open-settings": () => settingsModal(),
   "open-project": (el) => projectModal(el.dataset.id),
   "quick-install": (el) => quickInstall(el.dataset.id),
   "load-more": () => { S.explore.offset = S.explore.hits.length; search(false); },

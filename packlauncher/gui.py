@@ -24,11 +24,17 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import (__version__, auth, instances, java, launch, loaders, minecraft, modrinth,
-               paths, settings)
+from . import (__version__, auth, curseforge, instances, java, launch, loaders, minecraft,
+               modrinth, paths, settings)
 from .instances import Instance
 
 WEB_DIR = Path(__file__).parent / "web"
+
+
+def provider(key: str | None):
+    """Módulo da plataforma: ids "cf:123" ou source "curseforge" usam o CurseForge."""
+    key = str(key or "")
+    return curseforge if key.startswith("cf:") or key == "curseforge" else modrinth
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +184,8 @@ class App:
             "default_account": default["uuid"] if default else None,
             "tasks": [t.as_dict() for t in self.tasks.items.values()],
             "settings": {k: cfg.get(k) for k in ("default_memory_mb", "download_workers", "msa_client_id",
-                                                  "auto_download_java", "java_paths")},
+                                                  "auto_download_java", "java_paths", "curseforge_api_key",
+                                                  "curseforge_api_url")},
             "data_dir": str(paths.root()),
         }
 
@@ -214,7 +221,7 @@ class App:
 
     def install(self, project: str, version: str | None, name: str | None, title: str) -> dict:
         def run(task: Task) -> None:
-            inst = modrinth.install_pack(project, version, name, task.log, task.progress)
+            inst = provider(project).install_pack(project, version, name, task.log, task.progress)
             task.instance = inst.dir.name
             task.log(f"{inst.name} instalado!")
         return self.tasks.start(f"Instalando {title}", run).as_dict()
@@ -226,7 +233,10 @@ class App:
 
         def run(task: Task) -> None:
             try:
-                inst = modrinth.import_mrpack(path, None, task.log, task.progress)
+                if curseforge.is_curseforge_pack(path):
+                    inst = curseforge.import_pack(path, None, task.log, task.progress)
+                else:
+                    inst = modrinth.import_mrpack(path, None, task.log, task.progress)
                 task.instance = inst.dir.name
                 task.log(f"{inst.name} importado!")
             finally:
@@ -236,12 +246,12 @@ class App:
     def update(self, inst_id: str, version_id: str | None) -> dict:
         inst = self.get_instance(inst_id)
         return self.tasks.start(f"Atualizando {inst.name}",
-                                lambda t: modrinth.update_pack(inst, version_id, t.log, t.progress),
+                                lambda t: provider(inst.pack.get("source")).update_pack(inst, version_id, t.log, t.progress),
                                 inst_id).as_dict()
 
     def add_project(self, inst_id: str, project: str, title: str) -> dict:
         inst = self.get_instance(inst_id)
-        return self.tasks.start(f"Adicionando {title}", lambda t: modrinth.add_project(inst, project, t.log),
+        return self.tasks.start(f"Adicionando {title}", lambda t: provider(project).add_project(inst, project, t.log),
                                 inst_id).as_dict()
 
     def login_microsoft(self) -> dict:
@@ -499,7 +509,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @route("GET", r"/api/instances/([^/]+)/update")
     def check_update(self, query, inst_id) -> None:
-        latest = modrinth.check_update(self.app.get_instance(inst_id))
+        inst = self.app.get_instance(inst_id)
+        latest = provider(inst.pack.get("source")).check_update(inst)
         self._json({"latest": latest and {"id": latest["id"], "version_number": latest["version_number"]}})
 
     @route("POST", r"/api/instances/([^/]+)/update")
@@ -528,18 +539,19 @@ class Handler(BaseHTTPRequestHandler):
     @route("GET", "/api/search")
     def search(self, query) -> None:
         q = {k: v[0] for k, v in query.items()}
-        self._json(modrinth.search(q.get("q", ""), q.get("type", "modpack"), q.get("mc") or None,
+        self._json(provider(q.get("source")).search(q.get("q", ""), q.get("type", "modpack"), q.get("mc") or None,
                                    q.get("loader") or None, int(q.get("limit", 24)), int(q.get("offset", 0))))
 
     @route("GET", r"/api/project/([^/]+)")
     def project(self, query, pid) -> None:
-        self._json(modrinth.get_project(pid))
+        self._json(provider(pid).get_project(pid))
 
     @route("GET", r"/api/project/([^/]+)/versions")
     def project_versions(self, query, pid) -> None:
         loader = query.get("loader", [None])[0]
         mc = query.get("mc", [None])[0]
-        self._json(modrinth.get_versions(pid, [loader] if loader else None, [mc] if mc else None))
+        versions = provider(pid).get_versions(pid, [loader] if loader else None, [mc] if mc else None)
+        self._json([{k: v for k, v in x.items() if k != "file"} for x in versions])
 
     @route("POST", "/api/install")
     def install(self, query) -> None:
@@ -599,6 +611,11 @@ class Handler(BaseHTTPRequestHandler):
             data["download_workers"] = min(32, max(1, int(body["download_workers"])))
         if "msa_client_id" in body:
             data["msa_client_id"] = str(body["msa_client_id"]).strip()
+        for key in ("curseforge_api_key", "curseforge_api_url"):
+            if key in body:
+                data[key] = str(body[key]).strip()
+        if not data.get("curseforge_api_url"):
+            data["curseforge_api_url"] = curseforge.OFFICIAL_URL
         if "auto_download_java" in body:
             data["auto_download_java"] = bool(body["auto_download_java"])
         if "java_paths" in body:

@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__, auth, instances, launch, loaders, minecraft, modrinth, net, settings
+from . import __version__, auth, curseforge, instances, launch, loaders, minecraft, modrinth, net, settings
 
 
 def _progress():
@@ -29,17 +29,24 @@ def _human(n: int) -> str:
     return f"{n}B"
 
 
+def _provider(key):
+    """CurseForge para ids "cf:123" (ou source "curseforge"); Modrinth caso contrário."""
+    key = str(key or "")
+    return curseforge if key.startswith("cf:") or key in ("curseforge", "True") else modrinth
+
+
 def cmd_search(a) -> None:
-    res = modrinth.search(a.query, game_version=a.mc, loader=a.loader, limit=a.limit)
+    res = _provider(a.cf).search(a.query, game_version=a.mc, loader=a.loader, limit=a.limit)
     for hit in res["hits"]:
         mc = hit.get("versions", [])[-1:] or ["?"]
-        print(f"{hit['slug']:<32} {_human(hit['downloads']):>6} ↓  MC {mc[0]:<8} {hit['title']}")
+        ident = hit["project_id"] if a.cf else hit["slug"]
+        print(f"{ident:<32} {_human(hit['downloads']):>6} ↓  MC {mc[0]:<8} {hit['title']}")
         print(f"    {hit['description'][:100]}")
     print(f"\n{res['total_hits']} resultados. Instale com: packlauncher install <slug>")
 
 
 def cmd_versions(a) -> None:
-    for v in modrinth.get_versions(a.project)[: a.limit]:
+    for v in _provider(a.project).get_versions(a.project)[: a.limit]:
         print(f"{v['id']}  {v['version_number']:<20} {v['version_type']:<8} "
               f"MC {', '.join(v['game_versions'])}  [{', '.join(v['loaders'])}]")
 
@@ -47,23 +54,25 @@ def cmd_versions(a) -> None:
 def cmd_install(a) -> None:
     optional = (lambda f: False) if a.no_optional else (lambda f: True)
     source = a.source
-    if source.endswith(".mrpack") and Path(source).exists():
+    if source.endswith(".zip") and Path(source).exists():
+        inst = curseforge.import_pack(Path(source), a.name, progress=_progress())
+    elif source.endswith(".mrpack") and Path(source).exists():
         inst = modrinth.import_mrpack(Path(source), a.name, progress=_progress(),
                                       include_optional=optional)
     else:
-        inst = modrinth.install_pack(source, a.version, a.name, progress=_progress(),
-                                     include_optional=optional)
+        inst = _provider(source).install_pack(source, a.version, a.name, progress=_progress(),
+                                              include_optional=optional)
     print(f"Pronto! Jogue com: packlauncher launch \"{inst.name}\"")
 
 
 def cmd_update(a) -> None:
     inst = instances.find(a.instance)
     if a.check:
-        latest = modrinth.check_update(inst)
+        latest = _provider(inst.pack.get("source")).check_update(inst)
         print(f"Atualização disponível: {latest['version_number']}" if latest
               else "O modpack está atualizado.")
         return
-    modrinth.update_pack(inst, a.version, progress=_progress())
+    _provider(inst.pack.get("source")).update_pack(inst, a.version, progress=_progress())
 
 
 def cmd_create(a) -> None:
@@ -93,7 +102,7 @@ def cmd_delete(a) -> None:
 def cmd_mods(a) -> None:
     inst = instances.find(a.instance)
     if a.add:
-        modrinth.add_project(inst, a.add)
+        _provider(a.add).add_project(inst, a.add)
     for name in a.enable or []:
         instances.set_mod_enabled(inst, name, True)
     for name in a.disable or []:
@@ -184,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mc", help="versão do Minecraft")
     s.add_argument("--loader", choices=loaders.LOADERS[1:])
     s.add_argument("--limit", type=int, default=15)
+    s.add_argument("--cf", action="store_true", help="busca no CurseForge em vez do Modrinth")
     s.set_defaults(func=cmd_search)
 
     s = sub.add_parser("versions", help="lista versões de um modpack")
@@ -191,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=15)
     s.set_defaults(func=cmd_versions)
 
-    s = sub.add_parser("install", help="instala um modpack (slug do Modrinth ou arquivo .mrpack)")
+    s = sub.add_parser("install", help="instala um modpack (slug do Modrinth, cf:ID do CurseForge, .mrpack ou .zip)")
     s.add_argument("source")
     s.add_argument("--version", help="id da versão do modpack (padrão: mais recente)")
     s.add_argument("--name", help="nome da instância")
