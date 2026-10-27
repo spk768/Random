@@ -450,7 +450,7 @@ async function search(reset) {
   ex.loading = true;
   ex.error = null;
   const seq = ++ex.seq;
-  renderView();
+  renderExplore();
   const params = new URLSearchParams({ source: ex.source, q: ex.q, type: ex.type, mc: ex.mc, loader: ex.type === "modpack" || ex.type === "mod" ? ex.loader : "", offset: ex.offset, limit: 24 });
   try {
     const res = await api(`/api/search?${params}`);
@@ -462,11 +462,24 @@ async function search(reset) {
     ex.error = e.message;
   }
   ex.loading = false;
-  if (S.view === "explore") {
-    const focused = document.activeElement?.id;
-    const pos = document.activeElement?.selectionStart;
-    renderView();
-    if (focused === "explore-q") { const el = $("#explore-q"); el.focus(); el.setSelectionRange(pos, pos); }
+  renderExplore();
+}
+
+/** Redesenha o explorador sem tirar o foco/cursor do campo de busca. */
+function renderExplore() {
+  if (S.view !== "explore") return;
+  const active = document.activeElement;
+  const typing = active?.id === "explore-q";
+  const start = typing ? active.selectionStart : 0;
+  const end = typing ? active.selectionEnd : 0;
+  const scroll = $("#view").scrollTop;
+  renderView();
+  $("#view").scrollTop = scroll;
+  if (typing) {
+    const el = $("#explore-q");
+    el.value = S.explore.q;
+    el.focus();
+    el.setSelectionRange(start, end);
   }
 }
 
@@ -907,7 +920,7 @@ document.addEventListener("input", (e) => {
   if (el.id === "explore-q") {
     S.explore.q = el.value;
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => search(true), 350);
+    searchTimer = setTimeout(() => search(true), 1000);  // busca 1s após parar de digitar
   }
   if (el.id === "mod-filter") {
     S.modFilter = el.value;
