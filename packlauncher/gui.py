@@ -1,733 +1,699 @@
-"""Interface gráfica (tkinter)."""
+"""Interface gráfica: servidor local + página web (estilo GD Launcher).
+
+A interface roda em uma janela de aplicativo do Chrome/Edge/Chromium quando
+disponível (sem barra de endereço), ou no navegador padrão.
+"""
 from __future__ import annotations
 
+import json
+import mimetypes
 import os
 import queue
+import re
+import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
+import urllib.parse
 import webbrowser
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
-
-from . import __version__, auth, instances, launch, loaders, minecraft, modrinth
+from . import (__version__, auth, instances, java, launch, loaders, minecraft, modrinth,
+               paths, settings)
 from .instances import Instance
 
-
-def open_folder(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "win32":
-        os.startfile(path)  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(path)])
-    else:
-        subprocess.Popen(["xdg-open", str(path)])
+WEB_DIR = Path(__file__).parent / "web"
 
 
-def _human(n: int) -> str:
-    for unit in ("", "K", "M"):
-        if n < 1000:
-            return f"{n}{unit}"
-        n //= 1000
-    return f"{n}B"
+# ---------------------------------------------------------------------------
+# Eventos e tarefas em segundo plano
+# ---------------------------------------------------------------------------
 
+class Hub:
+    """Distribui eventos para os clientes conectados via Server-Sent Events."""
 
-class App(tk.Tk):
     def __init__(self) -> None:
-        super().__init__()
-        self.title(f"PackLauncher {__version__}")
-        self.geometry("1000x640")
-        self.minsize(820, 520)
-        self.events: queue.Queue = queue.Queue()
-        self.busy = False
-        self.running: dict[str, subprocess.Popen] = {}
-        self._build()
-        self.refresh_instances()
-        self.refresh_accounts()
-        self.after(50, self._drain_events)
+        self.clients: set[queue.Queue] = set()
+        self.lock = threading.Lock()
+        self.last_disconnect = time.time()
 
-    # ------------------------------------------------------------------ layout
-    def _build(self) -> None:
-        style = ttk.Style(self)
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure("Play.TButton", font=("TkDefaultFont", 12, "bold"), padding=8)
-        style.configure("Title.TLabel", font=("TkDefaultFont", 15, "bold"))
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue()
+        with self.lock:
+            self.clients.add(q)
+        return q
 
-        bar = ttk.Frame(self, padding=(8, 8, 8, 4))
-        bar.pack(fill="x")
-        ttk.Button(bar, text="🔎 Buscar modpacks", command=lambda: SearchDialog(self)).pack(side="left")
-        ttk.Button(bar, text="📦 Importar .mrpack", command=self.import_mrpack).pack(side="left", padx=4)
-        ttk.Button(bar, text="➕ Nova instância", command=lambda: NewInstanceDialog(self)).pack(side="left")
-        ttk.Button(bar, text="👤 Contas", command=lambda: AccountsDialog(self)).pack(side="right")
-        self.account_var = tk.StringVar()
-        self.account_box = ttk.Combobox(bar, textvariable=self.account_var, state="readonly", width=18)
-        self.account_box.pack(side="right", padx=4)
-        self.account_box.bind("<<ComboboxSelected>>", self._account_selected)
-        ttk.Label(bar, text="Conta:").pack(side="right")
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self.lock:
+            self.clients.discard(q)
+            self.last_disconnect = time.time()
 
-        paned = ttk.PanedWindow(self, orient="vertical")
-        paned.pack(fill="both", expand=True, padx=8)
-        top = ttk.PanedWindow(paned, orient="horizontal")
-        paned.add(top, weight=3)
+    def publish(self, event: str, data) -> None:
+        with self.lock:
+            for q in self.clients:
+                q.put((event, data))
 
-        left = ttk.Frame(top)
-        top.add(left, weight=2)
-        self.tree = ttk.Treeview(left, columns=("versao", "pack"), show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="Instância")
-        self.tree.heading("versao", text="Versão")
-        self.tree.heading("pack", text="Modpack")
-        self.tree.column("#0", width=200)
-        self.tree.column("versao", width=180)
-        self.tree.column("pack", width=120)
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.show_details())
-        self.tree.bind("<Double-1>", lambda e: self.play())
 
-        right = ttk.Frame(top, padding=10)
-        top.add(right, weight=1)
-        self.title_lbl = ttk.Label(right, text="Selecione uma instância", style="Title.TLabel", wraplength=300)
-        self.title_lbl.pack(anchor="w")
-        self.info_lbl = ttk.Label(right, text="", justify="left", wraplength=300)
-        self.info_lbl.pack(anchor="w", pady=(4, 12))
-        self.play_btn = ttk.Button(right, text="▶  Jogar", style="Play.TButton", command=self.play)
-        self.play_btn.pack(fill="x", pady=(0, 8))
-        self.action_buttons = []
-        for text, cmd in (("⟳ Atualizar modpack", self.update_pack), ("🧩 Mods", self.open_mods),
-                          ("📁 Abrir pasta", self.open_instance_folder), ("⚙ Configurações", self.edit_instance),
-                          ("💾 Exportar .mrpack", self.export_pack), ("🗑 Excluir", self.delete_instance)):
-            btn = ttk.Button(right, text=text, command=cmd)
-            btn.pack(fill="x", pady=2)
-            self.action_buttons.append(btn)
+class Task:
+    def __init__(self, tasks: "Tasks", title: str, instance: str | None) -> None:
+        self.id = secrets.token_hex(4)
+        self.tasks = tasks
+        self.title = title
+        self.instance = instance
+        self.status = "running"
+        self.message = ""
+        self.done = 0
+        self.total = 0
+        self._last_emit = 0.0
 
-        bottom = ttk.Frame(paned)
-        paned.add(bottom, weight=1)
-        status = ttk.Frame(bottom)
-        status.pack(fill="x", pady=(6, 2))
-        self.status_var = tk.StringVar(value="Pronto")
-        ttk.Label(status, textvariable=self.status_var).pack(side="left")
-        self.progress = ttk.Progressbar(status, length=260, mode="determinate")
-        self.progress.pack(side="right")
-        log_frame = ttk.Frame(bottom)
-        log_frame.pack(fill="both", expand=True, pady=(0, 8))
-        self.log_text = tk.Text(log_frame, height=8, wrap="none", state="disabled",
-                                background="#1e1e1e", foreground="#d4d4d4", font=("TkFixedFont", 9))
-        scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.log_text.pack(fill="both", expand=True)
-        self.show_details()
+    def as_dict(self) -> dict:
+        return {"id": self.id, "title": self.title, "instance": self.instance, "status": self.status,
+                "message": self.message, "done": self.done, "total": self.total}
 
-    # ------------------------------------------------------------- threading
     def log(self, msg: str) -> None:
-        """Seguro para chamar de qualquer thread."""
-        self.events.put(("log", msg))
+        self.message = msg
+        if self.instance:
+            self.tasks.app.add_log(self.instance, msg)
+        self.emit(force=True)
 
-    def set_progress(self, done: int, total: int) -> None:
-        self.events.put(("progress", (done, total)))
+    def progress(self, done: int, total: int) -> None:
+        self.done, self.total = done, total
+        self.emit(force=done == total)
 
-    def call(self, fn, *args) -> None:
-        """Agenda fn(*args) na thread da interface."""
-        self.events.put(("call", (fn, args)))
+    def emit(self, force: bool = False) -> None:
+        now = time.time()
+        if force or now - self._last_emit > 0.15:
+            self._last_emit = now
+            self.tasks.app.hub.publish("task", self.as_dict())
 
-    def _drain_events(self) -> None:
-        lines = []
-        try:
-            for _ in range(500):
-                kind, data = self.events.get_nowait()
-                if kind == "log":
-                    lines.append(data)
-                elif kind == "progress":
-                    done, total = data
-                    self.progress["maximum"] = max(total, 1)
-                    self.progress["value"] = done
-                elif kind == "call":
-                    fn, args = data
-                    fn(*args)
-        except queue.Empty:
-            pass
-        if lines:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", "\n".join(lines) + "\n")
-            excess = int(self.log_text.index("end-1c").split(".")[0]) - 3000
-            if excess > 0:
-                self.log_text.delete("1.0", f"{excess}.0")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-            self.status_var.set(lines[-1][:90])
-        self.after(50, self._drain_events)
 
-    def run_task(self, label: str, fn, on_done=None) -> None:
-        if self.busy:
-            messagebox.showinfo("Aguarde", "Já existe uma tarefa em andamento.")
-            return
-        self.busy = True
-        self.status_var.set(label)
-        self.progress["value"] = 0
-        self.log(label)
+class Tasks:
+    def __init__(self, app: "App") -> None:
+        self.app = app
+        self.items: dict[str, Task] = {}
+
+    def start(self, title: str, fn, instance: str | None = None) -> Task:
+        task = Task(self, title, instance)
+        self.items[task.id] = task
+        task.emit(force=True)
 
         def worker():
             try:
-                result = fn()
-            except Exception as e:  # mostra qualquer falha ao usuário
-                self.log(f"Erro: {e}")
-                self.call(messagebox.showerror, "Erro", str(e))
-                result = None
-                ok = False
-            else:
-                ok = True
-            self.call(self._task_finished, on_done if ok else None, result)
+                fn(task)
+                task.status = "done"
+            except Exception as e:
+                traceback.print_exc()
+                task.status = "error"
+                task.message = str(e)
+                if task.instance:
+                    self.app.add_log(task.instance, f"Erro: {e}")
+            task.emit(force=True)
+            self.app.hub.publish("state", None)
+            threading.Timer(30, lambda: self.items.pop(task.id, None)).start()
 
         threading.Thread(target=worker, daemon=True).start()
+        return task
 
-    def _task_finished(self, on_done, result) -> None:
-        self.busy = False
-        self.status_var.set("Pronto")
-        self.refresh_instances()
-        if on_done:
-            on_done(result)
+    def busy(self, instance: str) -> bool:
+        return any(t.instance == instance and t.status == "running" for t in self.items.values())
 
-    # ---------------------------------------------------------- instâncias
-    def selected(self) -> Instance | None:
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        try:
-            return instances.load(Path(sel[0]))
-        except (OSError, ValueError):
-            return None
 
-    def refresh_instances(self, select: str | None = None) -> None:
-        current = select or (self.tree.selection() or [None])[0]
-        self.tree.delete(*self.tree.get_children())
-        for inst in instances.list_all():
-            pack = inst.pack.get("version_number") or ("—" if not inst.pack else "")
-            self.tree.insert("", "end", iid=str(inst.dir), text=inst.name, values=(inst.describe(), pack))
-        if current and self.tree.exists(current):
-            self.tree.selection_set(current)
-        elif self.tree.get_children():
-            self.tree.selection_set(self.tree.get_children()[0])
-        self.show_details()
+# ---------------------------------------------------------------------------
+# Estado da aplicação
+# ---------------------------------------------------------------------------
 
-    def show_details(self) -> None:
-        inst = self.selected()
-        state = "normal" if inst else "disabled"
-        for btn in [self.play_btn, *self.action_buttons]:
-            btn.configure(state=state)
-        if not inst:
-            self.title_lbl.configure(text="Nenhuma instância")
-            self.info_lbl.configure(text="Use “Buscar modpacks” para instalar um modpack do Modrinth.")
-            return
-        mods = instances.list_mods(inst)
-        active = sum(m["enabled"] for m in mods)
-        lines = [inst.describe()]
-        if inst.pack.get("title"):
-            lines.append(f"Modpack: {inst.pack['title']} {inst.pack.get('version_number', '')}")
-        lines.append(f"Mods: {active} ativos de {len(mods)}")
-        lines.append(f"Memória: {inst.effective_memory} MB")
-        lines.append(f"Tempo de jogo: {inst.playtime / 3600:.1f} h")
-        if inst.last_played:
-            lines.append("Última vez: " + time.strftime("%d/%m/%Y %H:%M", time.localtime(inst.last_played)))
-        self.title_lbl.configure(text=inst.name)
-        self.info_lbl.configure(text="\n".join(lines))
-        running = str(inst.dir) in self.running
-        self.play_btn.configure(text="■  Fechar jogo" if running else "▶  Jogar")
-        self.action_buttons[0].configure(state="normal" if inst.pack.get("source") == "modrinth" else "disabled")
+def _loader_label(loader: str) -> str:
+    return {"vanilla": "Vanilla", "fabric": "Fabric", "quilt": "Quilt",
+            "forge": "Forge", "neoforge": "NeoForge"}.get(loader, loader)
 
-    def play(self) -> None:
-        inst = self.selected()
-        if not inst:
-            return
-        key = str(inst.dir)
-        if key in self.running:
-            if messagebox.askyesno("Fechar", "Forçar o fechamento do jogo?"):
-                self.running[key].terminate()
-            return
-        account = self.current_account()
+
+def instance_dict(inst: Instance, running: bool = False) -> dict:
+    mods = instances.list_mods(inst)
+    return {
+        "id": inst.dir.name, "name": inst.name, "minecraft": inst.minecraft,
+        "loader": inst.loader, "loader_label": _loader_label(inst.loader),
+        "loader_version": inst.loader_version, "pack": {k: v for k, v in inst.pack.items() if k != "files"},
+        "memory_mb": inst.memory_mb, "effective_memory": inst.effective_memory,
+        "java_path": inst.java_path, "jvm_args": inst.jvm_args, "width": inst.width, "height": inst.height,
+        "last_played": inst.last_played, "playtime": inst.playtime, "created": inst.created,
+        "mods_total": len(mods), "mods_enabled": sum(m["enabled"] for m in mods), "running": running,
+    }
+
+
+class App:
+    def __init__(self) -> None:
+        self.hub = Hub()
+        self.tasks = Tasks(self)
+        self.running: dict[str, subprocess.Popen] = {}
+        self.logs: dict[str, deque] = {}
+        self.token = secrets.token_urlsafe(24)
+        self.login_cancel: threading.Event | None = None
+
+    def add_log(self, inst_id: str, line: str) -> None:
+        self.logs.setdefault(inst_id, deque(maxlen=3000)).append(line)
+        self.hub.publish("log", {"instance": inst_id, "line": line})
+
+    def get_instance(self, inst_id: str) -> Instance:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", inst_id) or inst_id in (".", ".."):
+            raise KeyError(inst_id)
+        directory = paths.instances_dir() / inst_id
+        if not (directory / "instance.json").is_file():
+            raise KeyError(f"Instância não encontrada: {inst_id}")
+        return instances.load(directory)
+
+    def state(self) -> dict:
+        default = auth.get_default()
+        accounts = [{k: a[k] for k in ("name", "uuid", "type")} for a in auth.list_accounts()]
+        cfg = settings.load()
+        return {
+            "version": __version__,
+            "instances": [instance_dict(i, i.dir.name in self.running) for i in instances.list_all()],
+            "accounts": accounts,
+            "default_account": default["uuid"] if default else None,
+            "tasks": [t.as_dict() for t in self.tasks.items.values()],
+            "settings": {k: cfg.get(k) for k in ("default_memory_mb", "download_workers", "msa_client_id",
+                                                  "auto_download_java", "java_paths")},
+            "data_dir": str(paths.root()),
+        }
+
+    # ------------------------------------------------------------ ações
+    def launch(self, inst_id: str) -> dict:
+        if inst_id in self.running:
+            raise ValueError("A instância já está em execução")
+        if self.tasks.busy(inst_id):
+            raise ValueError("Aguarde a tarefa em andamento terminar")
+        inst = self.get_instance(inst_id)
+        account = auth.get_default()
         if not account:
-            messagebox.showinfo("Conta", "Adicione uma conta antes de jogar.")
-            AccountsDialog(self)
-            return
+            raise ValueError("Adicione uma conta antes de jogar")
+        self.logs[inst_id] = deque(maxlen=3000)
 
         def on_exit(code: int) -> None:
-            self.call(self._game_exited, key, code)
+            self.running.pop(inst_id, None)
+            self.hub.publish("state", None)
+            self.hub.publish("exit", {"instance": inst_id, "code": code})
 
-        def task():
-            return launch.launch(inst, account, self.log, self.set_progress, on_exit)
-
-        def started(proc):
+        def run(task: Task) -> None:
+            proc = launch.launch(inst, account, lambda m: self.add_log(inst_id, m), task.progress, on_exit)
             if proc.poll() is None:
-                self.running[key] = proc
-            self.show_details()
+                self.running[inst_id] = proc
+            task.log("Jogo iniciado")
 
-        self.run_task(f"Iniciando {inst.name}...", task, started)
+        return self.tasks.start(f"Iniciando {inst.name}", run, inst_id).as_dict()
 
-    def _game_exited(self, key: str, code: int) -> None:
-        self.running.pop(key, None)
-        self.refresh_instances()
-        if code not in (0, 1, 130, 143, -15):
-            messagebox.showwarning("Minecraft", f"O jogo fechou com erro (código {code}). Veja o log abaixo.")
+    def stop(self, inst_id: str) -> None:
+        proc = self.running.get(inst_id)
+        if proc:
+            proc.terminate()
 
-    def update_pack(self) -> None:
-        inst = self.selected()
-        if not inst:
-            return
+    def install(self, project: str, version: str | None, name: str | None, title: str) -> dict:
+        def run(task: Task) -> None:
+            inst = modrinth.install_pack(project, version, name, task.log, task.progress)
+            task.instance = inst.dir.name
+            task.log(f"{inst.name} instalado!")
+        return self.tasks.start(f"Instalando {title}", run).as_dict()
 
-        def check():
-            return modrinth.check_update(inst)
+    def import_pack(self, data: bytes, filename: str) -> dict:
+        tmp_dir = Path(tempfile.mkdtemp(dir=paths.cache_dir()))
+        path = tmp_dir / (Path(filename).name or "pack.mrpack")
+        path.write_bytes(data)
 
-        def checked(latest):
-            if not latest:
-                messagebox.showinfo("Atualizado", "O modpack já está na versão mais recente.")
-                return
-            if messagebox.askyesno("Atualização", f"Atualizar {inst.name} para {latest['version_number']}?\n\n"
-                                                  "Mundos e configurações pessoais são mantidos."):
-                self.run_task("Atualizando modpack...",
-                              lambda: modrinth.update_pack(inst, latest["id"], self.log, self.set_progress))
-
-        self.run_task("Verificando atualizações...", check, checked)
-
-    def open_mods(self) -> None:
-        inst = self.selected()
-        if inst:
-            ModsDialog(self, inst)
-
-    def open_instance_folder(self) -> None:
-        inst = self.selected()
-        if inst:
-            open_folder(inst.game_dir)
-
-    def edit_instance(self) -> None:
-        inst = self.selected()
-        if inst:
-            InstanceSettingsDialog(self, inst)
-
-    def export_pack(self) -> None:
-        inst = self.selected()
-        if not inst:
-            return
-        version = simpledialog.askstring("Exportar", "Versão do modpack:", initialvalue="1.0.0", parent=self)
-        if not version:
-            return
-        out = filedialog.asksaveasfilename(defaultextension=".mrpack", initialfile=f"{inst.name}-{version}.mrpack",
-                                           filetypes=[("Modrinth modpack", "*.mrpack")])
-        if out:
-            self.run_task("Exportando...", lambda: modrinth.export_mrpack(inst, Path(out), version, log=self.log),
-                          lambda p: messagebox.showinfo("Exportado", f"Salvo em {p}"))
-
-    def delete_instance(self) -> None:
-        inst = self.selected()
-        if inst and messagebox.askyesno("Excluir", f"Excluir “{inst.name}”?\nMundos e configurações serão "
-                                                   "apagados permanentemente.", icon="warning"):
-            instances.delete(inst)
-            self.refresh_instances()
-
-    def import_mrpack(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Modrinth modpack", "*.mrpack"), ("Todos", "*.*")])
-        if path:
-            self.run_task("Importando modpack...",
-                          lambda: modrinth.import_mrpack(Path(path), log=self.log, progress=self.set_progress),
-                          lambda inst: self.refresh_instances(str(inst.dir)))
-
-    # -------------------------------------------------------------- contas
-    def refresh_accounts(self) -> None:
-        accounts = auth.list_accounts()
-        self.account_box["values"] = [a["name"] for a in accounts]
-        default = auth.get_default()
-        self.account_var.set(default["name"] if default else "")
-
-    def _account_selected(self, _event=None) -> None:
-        acc = auth.find(self.account_var.get())
-        if acc:
-            auth.set_default(acc["uuid"])
-
-    def current_account(self) -> dict | None:
-        return auth.find(self.account_var.get()) if self.account_var.get() else auth.get_default()
-
-
-# ---------------------------------------------------------------------------
-# Diálogos
-# ---------------------------------------------------------------------------
-
-class Dialog(tk.Toplevel):
-    def __init__(self, app: App, title: str, size: str = "") -> None:
-        super().__init__(app)
-        self.app = app
-        self.title(title)
-        if size:
-            self.geometry(size)
-        self.transient(app)
-        self.body = ttk.Frame(self, padding=10)
-        self.body.pack(fill="both", expand=True)
-
-
-class SearchDialog(Dialog):
-    def __init__(self, app: App) -> None:
-        super().__init__(app, "Buscar modpacks no Modrinth", "900x560")
-        top = ttk.Frame(self.body)
-        top.pack(fill="x")
-        self.query = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=self.query)
-        entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self.search())
-        entry.focus_set()
-        ttk.Label(top, text=" MC:").pack(side="left")
-        self.mc = tk.StringVar()
-        ttk.Entry(top, textvariable=self.mc, width=9).pack(side="left")
-        ttk.Label(top, text=" Loader:").pack(side="left")
-        self.loader = tk.StringVar(value="")
-        ttk.Combobox(top, textvariable=self.loader, values=["", "fabric", "quilt", "forge", "neoforge"],
-                     state="readonly", width=9).pack(side="left")
-        ttk.Button(top, text="Buscar", command=self.search).pack(side="left", padx=(6, 0))
-
-        self.results = ttk.Treeview(self.body, columns=("downloads", "autor", "desc"), show="tree headings")
-        self.results.heading("#0", text="Modpack")
-        self.results.heading("downloads", text="Downloads")
-        self.results.heading("autor", text="Autor")
-        self.results.heading("desc", text="Descrição")
-        self.results.column("#0", width=200)
-        self.results.column("downloads", width=80, anchor="e")
-        self.results.column("autor", width=110)
-        self.results.column("desc", width=440)
-        self.results.pack(fill="both", expand=True, pady=8)
-        self.results.bind("<<TreeviewSelect>>", lambda e: self.load_versions())
-
-        bottom = ttk.Frame(self.body)
-        bottom.pack(fill="x")
-        ttk.Label(bottom, text="Versão:").pack(side="left")
-        self.version_var = tk.StringVar()
-        self.version_box = ttk.Combobox(bottom, textvariable=self.version_var, state="readonly", width=60)
-        self.version_box.pack(side="left", padx=4)
-        ttk.Button(bottom, text="Abrir no site", command=self.open_page).pack(side="right")
-        self.install_btn = ttk.Button(bottom, text="Instalar", command=self.install, state="disabled")
-        self.install_btn.pack(side="right", padx=4)
-        self.hits: dict[str, dict] = {}
-        self.versions: list[dict] = []
-        self.search()
-
-    def _bg(self, fn, done) -> None:
-        def worker():
+        def run(task: Task) -> None:
             try:
-                result = fn()
-            except Exception as e:
-                self.app.call(lambda msg=str(e): messagebox.showerror("Erro", msg, parent=self))
-                return
-            self.app.call(lambda: self.winfo_exists() and done(result))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def search(self) -> None:
-        q, mc, loader = self.query.get(), self.mc.get().strip() or None, self.loader.get() or None
-        self._bg(lambda: modrinth.search(q, game_version=mc, loader=loader, limit=40), self._show_results)
-
-    def _show_results(self, res: dict) -> None:
-        self.results.delete(*self.results.get_children())
-        self.hits = {h["project_id"]: h for h in res["hits"]}
-        for h in res["hits"]:
-            self.results.insert("", "end", iid=h["project_id"], text=h["title"],
-                                values=(_human(h["downloads"]), h.get("author", ""), h["description"]))
-
-    def _selected_hit(self) -> dict | None:
-        sel = self.results.selection()
-        return self.hits.get(sel[0]) if sel else None
-
-    def load_versions(self) -> None:
-        hit = self._selected_hit()
-        if not hit:
-            return
-        self.install_btn.configure(state="disabled")
-        self.version_box["values"] = ["Carregando..."]
-        self.version_var.set("Carregando...")
-        pid = hit["project_id"]
-        self._bg(lambda: modrinth.get_versions(pid), lambda vs: self._show_versions(pid, vs))
-
-    def _show_versions(self, pid: str, versions: list[dict]) -> None:
-        hit = self._selected_hit()
-        if not hit or hit["project_id"] != pid:
-            return
-        self.versions = versions
-        labels = [f"{v['version_number']}  —  MC {', '.join(v['game_versions'])}  "
-                  f"[{', '.join(v['loaders'])}]  {v['version_type']}" for v in versions]
-        self.version_box["values"] = labels
-        if labels:
-            self.version_box.current(0)
-            self.install_btn.configure(state="normal")
-        else:
-            self.version_var.set("Sem versões")
-
-    def open_page(self) -> None:
-        hit = self._selected_hit()
-        if hit:
-            webbrowser.open(f"https://modrinth.com/modpack/{hit['slug']}")
-
-    def install(self) -> None:
-        hit = self._selected_hit()
-        idx = self.version_box.current()
-        if not hit or idx < 0 or idx >= len(self.versions):
-            return
-        version = self.versions[idx]
-        name = simpledialog.askstring("Instalar", "Nome da instância:",
-                                      initialvalue=instances.unique_name(hit["title"]), parent=self)
-        if not name:
-            return
-        self.destroy()
-        self.app.run_task(f"Instalando {hit['title']} {version['version_number']}...",
-                          lambda: modrinth.install_pack(hit["project_id"], version["id"], name,
-                                                        self.app.log, self.app.set_progress),
-                          lambda inst: self.app.refresh_instances(str(inst.dir)))
-
-
-class NewInstanceDialog(Dialog):
-    def __init__(self, app: App) -> None:
-        super().__init__(app, "Nova instância")
-        self.resizable(False, False)
-        grid = self.body
-        self.name = tk.StringVar(value="Nova instância")
-        self.mc = tk.StringVar()
-        self.loader = tk.StringVar(value="fabric")
-        self.loader_version = tk.StringVar()
-        self.snapshots = tk.BooleanVar(value=False)
-        ttk.Label(grid, text="Nome:").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(grid, textvariable=self.name, width=34).grid(row=0, column=1, sticky="we")
-        ttk.Label(grid, text="Minecraft:").grid(row=1, column=0, sticky="w", pady=3)
-        self.mc_box = ttk.Combobox(grid, textvariable=self.mc, width=32)
-        self.mc_box.grid(row=1, column=1, sticky="we")
-        self.mc_box.bind("<<ComboboxSelected>>", lambda e: self.load_loader_versions())
-        ttk.Checkbutton(grid, text="Snapshots", variable=self.snapshots,
-                        command=self.load_mc_versions).grid(row=1, column=2, padx=4)
-        ttk.Label(grid, text="Loader:").grid(row=2, column=0, sticky="w", pady=3)
-        box = ttk.Combobox(grid, textvariable=self.loader, values=loaders.LOADERS, state="readonly", width=32)
-        box.grid(row=2, column=1, sticky="we")
-        box.bind("<<ComboboxSelected>>", lambda e: self.load_loader_versions())
-        ttk.Label(grid, text="Versão do loader:").grid(row=3, column=0, sticky="w", pady=3)
-        self.lv_box = ttk.Combobox(grid, textvariable=self.loader_version, width=32)
-        self.lv_box.grid(row=3, column=1, sticky="we")
-        ttk.Button(grid, text="Criar", command=self.create).grid(row=4, column=1, sticky="e", pady=(10, 0))
-        self.load_mc_versions()
-
-    def _bg(self, fn, done) -> None:
-        def worker():
-            try:
-                result = fn()
-            except Exception as e:
-                self.app.log(f"Erro: {e}")
-                result = []
-            self.app.call(lambda: self.winfo_exists() and done(result))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def load_mc_versions(self) -> None:
-        snaps = self.snapshots.get()
-
-        def done(versions):
-            self.mc_box["values"] = versions
-            if versions and self.mc.get() not in versions:
-                self.mc.set(versions[0])
-            self.load_loader_versions()
-        self._bg(lambda: minecraft.list_versions(snaps), done)
-
-    def load_loader_versions(self) -> None:
-        loader, mc = self.loader.get(), self.mc.get()
-        if loader == "vanilla" or not mc:
-            self.lv_box["values"] = []
-            self.loader_version.set("")
-            return
-        self.loader_version.set("Carregando...")
-
-        def done(versions):
-            if (loader, mc) != (self.loader.get(), self.mc.get()):
-                return
-            self.lv_box["values"] = versions
-            self.loader_version.set(versions[0] if versions else "")
-        self._bg(lambda: loaders.list_versions(loader, mc), done)
-
-    def create(self) -> None:
-        name, mc, loader = self.name.get().strip(), self.mc.get().strip(), self.loader.get()
-        lv = self.loader_version.get().strip()
-        if not name or not mc:
-            messagebox.showwarning("Nova instância", "Preencha nome e versão.", parent=self)
-            return
-        if loader != "vanilla" and (not lv or lv == "Carregando..."):
-            messagebox.showwarning("Nova instância", f"Nenhuma versão do {loader} para {mc}.", parent=self)
-            return
-        inst = instances.create(name, mc, loader, lv if loader != "vanilla" else None)
-        self.destroy()
-        self.app.refresh_instances(str(inst.dir))
-
-
-class ModsDialog(Dialog):
-    def __init__(self, app: App, inst: Instance) -> None:
-        super().__init__(app, f"Mods — {inst.name}", "620x480")
-        self.inst = inst
-        self.tree = ttk.Treeview(self.body, columns=("ativo", "origem"), show="tree headings")
-        self.tree.heading("#0", text="Arquivo")
-        self.tree.heading("ativo", text="Ativo")
-        self.tree.heading("origem", text="Origem")
-        self.tree.column("#0", width=400)
-        self.tree.column("ativo", width=60, anchor="center")
-        self.tree.column("origem", width=90, anchor="center")
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Double-1>", lambda e: self.toggle())
-        bar = ttk.Frame(self.body)
-        bar.pack(fill="x", pady=(8, 0))
-        ttk.Button(bar, text="Ativar/Desativar", command=self.toggle).pack(side="left")
-        ttk.Button(bar, text="Adicionar do Modrinth", command=self.add).pack(side="left", padx=4)
-        ttk.Button(bar, text="Abrir pasta", command=lambda: open_folder(inst.mods_dir)).pack(side="left")
-        ttk.Button(bar, text="Recarregar", command=self.refresh).pack(side="right")
-        ttk.Label(self.body, text="Dica: duplo clique ativa/desativa. Mods desativados continuam "
-                                  "desativados após atualizar o modpack.", foreground="gray").pack(anchor="w")
-        self.refresh()
-
-    def refresh(self) -> None:
-        self.inst = instances.load(self.inst.dir)
-        self.tree.delete(*self.tree.get_children())
-        for m in instances.list_mods(self.inst):
-            self.tree.insert("", "end", iid=m["file"], text=m["file"].removesuffix(".disabled"),
-                             values=("✔" if m["enabled"] else "✘", "modpack" if m["from_pack"] else "manual"))
-
-    def toggle(self) -> None:
-        for iid in self.tree.selection():
-            instances.set_mod_enabled(self.inst, iid, iid.endswith(".disabled"))
-        self.refresh()
-        self.app.show_details()
-
-    def add(self) -> None:
-        slug = simpledialog.askstring("Adicionar", "Slug ou ID do projeto no Modrinth\n"
-                                                   "(mod, resource pack ou shader):", parent=self)
-        if slug:
-            self.app.run_task(f"Adicionando {slug}...",
-                              lambda: modrinth.add_project(self.inst, slug.strip(), self.app.log),
-                              lambda _: self.winfo_exists() and self.refresh())
-
-
-class InstanceSettingsDialog(Dialog):
-    def __init__(self, app: App, inst: Instance) -> None:
-        super().__init__(app, f"Configurações — {inst.name}")
-        self.resizable(False, False)
-        self.inst = inst
-        g = self.body
-        self.name = tk.StringVar(value=inst.name)
-        self.memory = tk.IntVar(value=inst.effective_memory)
-        self.java = tk.StringVar(value=inst.java_path)
-        self.jvm = tk.StringVar(value=inst.jvm_args)
-        self.width = tk.IntVar(value=inst.width)
-        self.height = tk.IntVar(value=inst.height)
-        rows = [("Nome:", ttk.Entry(g, textvariable=self.name, width=40)),
-                ("Memória (MB):", ttk.Spinbox(g, from_=1024, to=65536, increment=512, textvariable=self.memory)),
-                ("Java (vazio = automático):", ttk.Entry(g, textvariable=self.java, width=40)),
-                ("Argumentos JVM extras:", ttk.Entry(g, textvariable=self.jvm, width=40)),
-                ("Largura da janela (0 = padrão):", ttk.Spinbox(g, from_=0, to=7680, textvariable=self.width)),
-                ("Altura da janela:", ttk.Spinbox(g, from_=0, to=4320, textvariable=self.height))]
-        for i, (label, widget) in enumerate(rows):
-            ttk.Label(g, text=label).grid(row=i, column=0, sticky="w", pady=3)
-            widget.grid(row=i, column=1, sticky="we")
-        ttk.Button(g, text="…", width=3, command=self.browse_java).grid(row=2, column=2, padx=2)
-        ttk.Button(g, text="Salvar", command=self.save).grid(row=len(rows), column=1, sticky="e", pady=(10, 0))
-
-    def browse_java(self) -> None:
-        path = filedialog.askopenfilename(parent=self, title="Executável do Java")
-        if path:
-            self.java.set(path)
-
-    def save(self) -> None:
-        try:
-            memory, width, height = self.memory.get(), self.width.get(), self.height.get()
-        except tk.TclError:
-            messagebox.showwarning("Configurações", "Valores numéricos inválidos.", parent=self)
-            return
-        inst = instances.load(self.inst.dir)
-        inst.name = self.name.get().strip() or inst.name
-        inst.memory_mb, inst.width, inst.height = memory, width, height
-        inst.java_path, inst.jvm_args = self.java.get().strip(), self.jvm.get().strip()
-        inst.save()
-        self.destroy()
-        self.app.refresh_instances()
-
-
-class AccountsDialog(Dialog):
-    def __init__(self, app: App) -> None:
-        super().__init__(app, "Contas", "460x320")
-        self.list = ttk.Treeview(self.body, columns=("tipo",), show="tree headings", selectmode="browse")
-        self.list.heading("#0", text="Nome")
-        self.list.heading("tipo", text="Tipo")
-        self.list.pack(fill="both", expand=True)
-        bar = ttk.Frame(self.body)
-        bar.pack(fill="x", pady=(8, 0))
-        ttk.Button(bar, text="Login Microsoft", command=self.login_ms).pack(side="left")
-        ttk.Button(bar, text="Conta offline", command=self.add_offline).pack(side="left", padx=4)
-        ttk.Button(bar, text="Remover", command=self.remove).pack(side="right")
-        ttk.Button(bar, text="Usar esta", command=self.make_default).pack(side="right", padx=4)
-        self.refresh()
-
-    def refresh(self) -> None:
-        self.list.delete(*self.list.get_children())
-        default = auth.get_default()
-        for a in auth.list_accounts():
-            star = "★ " if default and a["uuid"] == default["uuid"] else ""
-            self.list.insert("", "end", iid=a["uuid"], text=star + a["name"],
-                             values=("Microsoft" if a["type"] == "msa" else "Offline",))
-        self.app.refresh_accounts()
-
-    def add_offline(self) -> None:
-        name = simpledialog.askstring("Conta offline", "Nome de jogador:", parent=self)
-        if name:
-            try:
-                auth.add_offline(name.strip())
-            except auth.AuthError as e:
-                messagebox.showerror("Conta", str(e), parent=self)
-            self.refresh()
-
-    def make_default(self) -> None:
-        sel = self.list.selection()
-        if sel:
-            auth.set_default(sel[0])
-            self.refresh()
-
-    def remove(self) -> None:
-        sel = self.list.selection()
-        if sel and messagebox.askyesno("Remover", "Remover esta conta?", parent=self):
-            auth.remove(sel[0])
-            self.refresh()
-
-    def login_ms(self) -> None:
-        cancelled = threading.Event()
-        holder: dict = {}
-
-        def show_code(url: str, code: str) -> None:
-            def ui():
-                win = Dialog(self.app, "Login Microsoft")
-                holder["win"] = win
-                ttk.Label(win.body, text=f"1. Abra {url}\n2. Digite o código abaixo:").pack(anchor="w")
-                entry = ttk.Entry(win.body, font=("TkFixedFont", 18), justify="center")
-                entry.insert(0, code)
-                entry.configure(state="readonly")
-                entry.pack(fill="x", pady=8)
-                ttk.Button(win.body, text="Copiar código e abrir navegador",
-                           command=lambda: (self.app.clipboard_clear(), self.app.clipboard_append(code),
-                                            webbrowser.open(url))).pack(fill="x")
-                ttk.Label(win.body, text="Aguardando confirmação...", foreground="gray").pack(pady=(6, 0))
-                win.protocol("WM_DELETE_WINDOW", lambda: (cancelled.set(), win.destroy()))
-            self.app.call(ui)
-
-        def task():
-            try:
-                return auth.login_microsoft(show_code, cancelled.is_set)
+                inst = modrinth.import_mrpack(path, None, task.log, task.progress)
+                task.instance = inst.dir.name
+                task.log(f"{inst.name} importado!")
             finally:
-                self.app.call(lambda: holder.get("win") and holder["win"].winfo_exists()
-                              and holder["win"].destroy())
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        return self.tasks.start(f"Importando {path.name}", run).as_dict()
 
-        def done(acc):
-            messagebox.showinfo("Login", f"Logado como {acc['name']}")
-            if self.winfo_exists():
-                self.refresh()
+    def update(self, inst_id: str, version_id: str | None) -> dict:
+        inst = self.get_instance(inst_id)
+        return self.tasks.start(f"Atualizando {inst.name}",
+                                lambda t: modrinth.update_pack(inst, version_id, t.log, t.progress),
+                                inst_id).as_dict()
+
+    def add_project(self, inst_id: str, project: str, title: str) -> dict:
+        inst = self.get_instance(inst_id)
+        return self.tasks.start(f"Adicionando {title}", lambda t: modrinth.add_project(inst, project, t.log),
+                                inst_id).as_dict()
+
+    def login_microsoft(self) -> dict:
+        self.login_cancel = cancel = threading.Event()
+
+        def show(url: str, code: str) -> None:
+            self.hub.publish("login", {"url": url, "code": code})
+
+        def run(task: Task) -> None:
+            acc = auth.login_microsoft(show, cancel.is_set)
+            task.log(f"Logado como {acc['name']}")
+            self.hub.publish("login", {"done": True, "name": acc["name"]})
+        return self.tasks.start("Login Microsoft", run).as_dict()
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+class ApiError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+ROUTES: list[tuple[str, re.Pattern, str]] = []
+
+
+def route(method: str, pattern: str):
+    def deco(fn):
+        ROUTES.append((method, re.compile(f"^{pattern}$"), fn.__name__))
+        return fn
+    return deco
+
+
+class Handler(BaseHTTPRequestHandler):
+    app: App
+    port: int
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args) -> None:  # silencioso
+        pass
+
+    # ------------------------------------------------------------ helpers
+    def _send(self, status: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, data, status: int = 200) -> None:
+        self._send(status, json.dumps(data).encode(), "application/json; charset=utf-8")
+
+    def _body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _json_body(self) -> dict:
+        raw = self._body()
+        return json.loads(raw) if raw else {}
+
+    def _host_ok(self) -> bool:
+        # Evita DNS rebinding: só aceita o host local exato
+        return self.headers.get("Host") in (f"127.0.0.1:{self.port}", f"localhost:{self.port}")
+
+    def _authorized(self, query: dict) -> bool:
+        token = self.headers.get("X-Token") or query.get("t", [""])[0]
+        return secrets.compare_digest(token, self.app.token)
+
+    # ------------------------------------------------------------ dispatch
+    def do_GET(self) -> None:
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:
+        self._dispatch("POST")
+
+    def _dispatch(self, method: str) -> None:
+        if not self._host_ok():
+            self._send(403, b"forbidden", "text/plain")
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        path = parsed.path
+        if not path.startswith("/api/"):
+            if method == "GET":
+                self._static(path)
             else:
-                self.app.refresh_accounts()
+                self._send(405, b"", "text/plain")
+            return
+        if not self._authorized(query):
+            self._json({"error": "não autorizado"}, 401)
+            return
+        for m, pattern, name in ROUTES:
+            match = pattern.match(path)
+            if m == method and match:
+                try:
+                    getattr(self, name)(query, *match.groups())
+                except ApiError as e:
+                    self._json({"error": str(e)}, e.status)
+                except KeyError as e:
+                    self._json({"error": str(e).strip("'")}, 404)
+                except Exception as e:
+                    traceback.print_exc()
+                    self._json({"error": str(e)}, 400)
+                return
+        self._json({"error": "rota não encontrada"}, 404)
 
-        self.app.run_task("Login Microsoft...", task, done)
+    def _static(self, path: str) -> None:
+        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        target = (WEB_DIR / rel).resolve()
+        if WEB_DIR.resolve() not in target.parents or not target.is_file():
+            self._send(404, b"not found", "text/plain")
+            return
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype.endswith("javascript"):
+            ctype += "; charset=utf-8"
+        self._send(200, target.read_bytes(), ctype)
+
+    # ------------------------------------------------------------ rotas
+    @route("GET", "/api/events")
+    def events(self, query) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        q = self.app.hub.subscribe()
+        try:
+            self.wfile.write(b"event: hello\ndata: {}\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    event, data = q.get(timeout=15)
+                    chunk = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    chunk = ": ping\n\n"
+                self.wfile.write(chunk.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            self.app.hub.unsubscribe(q)
+            self.close_connection = True
+
+    @route("GET", "/api/state")
+    def get_state(self, query) -> None:
+        self._json(self.app.state())
+
+    @route("GET", r"/api/instances/([^/]+)")
+    def get_instance(self, query, inst_id) -> None:
+        inst = self.app.get_instance(inst_id)
+        data = instance_dict(inst, inst_id in self.app.running)
+        data["mods"] = [{"file": m["file"], "enabled": m["enabled"], "from_pack": m["from_pack"],
+                         "size": m["path"].stat().st_size} for m in instances.list_mods(inst)]
+        data["logs"] = list(self.app.logs.get(inst_id, []))
+        data["game_dir"] = str(inst.game_dir)
+        self._json(data)
+
+    @route("POST", "/api/instances")
+    def create_instance(self, query) -> None:
+        body = self._json_body()
+        name, mc, loader = body.get("name", "").strip(), body.get("minecraft", ""), body.get("loader", "vanilla")
+        if not name or not mc:
+            raise ApiError(400, "Informe nome e versão")
+        if loader not in loaders.LOADERS:
+            raise ApiError(400, "Loader inválido")
+        inst = instances.create(name, mc, loader, body.get("loader_version") or None)
+        self.app.hub.publish("state", None)
+        self._json({"id": inst.dir.name})
+
+    @route("POST", r"/api/instances/([^/]+)/launch")
+    def launch_instance(self, query, inst_id) -> None:
+        try:
+            self._json(self.app.launch(inst_id))
+        except ValueError as e:
+            raise ApiError(409, str(e))
+
+    @route("POST", r"/api/instances/([^/]+)/stop")
+    def stop_instance(self, query, inst_id) -> None:
+        self.app.stop(inst_id)
+        self._json({"ok": True})
+
+    @route("POST", r"/api/instances/([^/]+)/settings")
+    def save_instance(self, query, inst_id) -> None:
+        inst = self.app.get_instance(inst_id)
+        body = self._json_body()
+        if body.get("name", "").strip():
+            inst.name = body["name"].strip()
+        for key in ("memory_mb", "width", "height"):
+            if key in body:
+                inst.__setattr__(key, max(0, int(body[key] or 0)))
+        for key in ("java_path", "jvm_args"):
+            if key in body:
+                inst.__setattr__(key, str(body[key]).strip())
+        inst.save()
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("POST", r"/api/instances/([^/]+)/delete")
+    def delete_instance(self, query, inst_id) -> None:
+        if inst_id in self.app.running:
+            raise ApiError(409, "Feche o jogo antes de excluir")
+        instances.delete(self.app.get_instance(inst_id))
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("POST", r"/api/instances/([^/]+)/duplicate")
+    def duplicate_instance(self, query, inst_id) -> None:
+        src = self.app.get_instance(inst_id)
+        copy = instances.create(f"{src.name} (cópia)", src.minecraft, src.loader, src.loader_version)
+        shutil.rmtree(copy.dir)
+        shutil.copytree(src.dir, copy.dir, ignore=shutil.ignore_patterns("logs"))
+        dup = instances.load(copy.dir)
+        dup.name, dup.playtime, dup.last_played = copy.name, 0, 0
+        dup.save()
+        self.app.hub.publish("state", None)
+        self._json({"id": dup.dir.name})
+
+    @route("POST", r"/api/instances/([^/]+)/open-folder")
+    def open_folder(self, query, inst_id) -> None:
+        inst = self.app.get_instance(inst_id)
+        sub = self._json_body().get("sub", "")
+        folder = inst.game_dir / sub if sub in ("", "mods", "config", "saves", "resourcepacks",
+                                                "shaderpacks", "screenshots", "logs") else inst.game_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(folder)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+        self._json({"ok": True})
+
+    @route("POST", r"/api/instances/([^/]+)/mods/toggle")
+    def toggle_mod(self, query, inst_id) -> None:
+        body = self._json_body()
+        new = instances.set_mod_enabled(self.app.get_instance(inst_id), body["file"], bool(body["enabled"]))
+        self._json({"file": new})
+
+    @route("POST", r"/api/instances/([^/]+)/mods/delete")
+    def delete_mod(self, query, inst_id) -> None:
+        inst = self.app.get_instance(inst_id)
+        name = self._json_body()["file"]
+        target = inst.mods_dir / Path(name).name
+        if target.is_file():
+            target.unlink()
+        self._json({"ok": True})
+
+    @route("POST", r"/api/instances/([^/]+)/mods/add")
+    def add_mod(self, query, inst_id) -> None:
+        body = self._json_body()
+        self._json(self.app.add_project(inst_id, body["project"], body.get("title") or body["project"]))
+
+    @route("GET", r"/api/instances/([^/]+)/update")
+    def check_update(self, query, inst_id) -> None:
+        latest = modrinth.check_update(self.app.get_instance(inst_id))
+        self._json({"latest": latest and {"id": latest["id"], "version_number": latest["version_number"]}})
+
+    @route("POST", r"/api/instances/([^/]+)/update")
+    def update_instance(self, query, inst_id) -> None:
+        self._json(self.app.update(inst_id, self._json_body().get("version_id")))
+
+    @route("GET", r"/api/instances/([^/]+)/export")
+    def export_instance(self, query, inst_id) -> None:
+        inst = self.app.get_instance(inst_id)
+        version = query.get("version", ["1.0.0"])[0]
+        tmp_dir = Path(tempfile.mkdtemp(dir=paths.cache_dir()))
+        try:
+            out = modrinth.export_mrpack(inst, tmp_dir / "pack.mrpack", version,
+                                         log=lambda m: self.app.add_log(inst_id, m))
+            filename = re.sub(r"[^A-Za-z0-9._ -]+", "_", f"{inst.name}-{version}.mrpack")
+            self._send(200, out.read_bytes(), "application/x-modrinth-modpack+zip",
+                       {"Content-Disposition": f'attachment; filename="{filename}"'})
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @route("POST", "/api/import")
+    def import_pack(self, query) -> None:
+        filename = urllib.parse.unquote(self.headers.get("X-Filename", "pack.mrpack"))
+        self._json(self.app.import_pack(self._body(), filename))
+
+    @route("GET", "/api/search")
+    def search(self, query) -> None:
+        q = {k: v[0] for k, v in query.items()}
+        self._json(modrinth.search(q.get("q", ""), q.get("type", "modpack"), q.get("mc") or None,
+                                   q.get("loader") or None, int(q.get("limit", 24)), int(q.get("offset", 0))))
+
+    @route("GET", r"/api/project/([^/]+)")
+    def project(self, query, pid) -> None:
+        self._json(modrinth.get_project(pid))
+
+    @route("GET", r"/api/project/([^/]+)/versions")
+    def project_versions(self, query, pid) -> None:
+        loader = query.get("loader", [None])[0]
+        mc = query.get("mc", [None])[0]
+        self._json(modrinth.get_versions(pid, [loader] if loader else None, [mc] if mc else None))
+
+    @route("POST", "/api/install")
+    def install(self, query) -> None:
+        body = self._json_body()
+        self._json(self.app.install(body["project"], body.get("version_id"), body.get("name") or None,
+                                    body.get("title") or body["project"]))
+
+    @route("GET", "/api/mc-versions")
+    def mc_versions(self, query) -> None:
+        self._json(minecraft.list_versions("snapshots" in query))
+
+    @route("GET", "/api/loader-versions")
+    def loader_versions(self, query) -> None:
+        self._json(loaders.list_versions(query["loader"][0], query["mc"][0]))
+
+    @route("POST", "/api/accounts/offline")
+    def add_offline(self, query) -> None:
+        try:
+            acc = auth.add_offline(self._json_body().get("name", "").strip())
+        except auth.AuthError as e:
+            raise ApiError(400, str(e))
+        auth.set_default(acc["uuid"])
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("POST", "/api/accounts/microsoft")
+    def login_microsoft(self, query) -> None:
+        if not settings.get("msa_client_id"):
+            raise ApiError(400, "Configure o Client ID do Azure em Configurações para usar contas Microsoft")
+        self._json(self.app.login_microsoft())
+
+    @route("POST", "/api/accounts/microsoft/cancel")
+    def cancel_login(self, query) -> None:
+        if self.app.login_cancel:
+            self.app.login_cancel.set()
+        self._json({"ok": True})
+
+    @route("POST", "/api/accounts/default")
+    def default_account(self, query) -> None:
+        auth.set_default(self._json_body()["uuid"])
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("POST", "/api/accounts/remove")
+    def remove_account(self, query) -> None:
+        auth.remove(self._json_body()["uuid"])
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("POST", "/api/settings")
+    def save_settings(self, query) -> None:
+        body = self._json_body()
+        data = settings.load()
+        if "default_memory_mb" in body:
+            data["default_memory_mb"] = max(512, int(body["default_memory_mb"]))
+        if "download_workers" in body:
+            data["download_workers"] = min(32, max(1, int(body["download_workers"])))
+        if "msa_client_id" in body:
+            data["msa_client_id"] = str(body["msa_client_id"]).strip()
+        if "auto_download_java" in body:
+            data["auto_download_java"] = bool(body["auto_download_java"])
+        if "java_paths" in body:
+            data["java_paths"] = {str(k): str(v) for k, v in body["java_paths"].items() if v}
+        settings.save(data)
+        self.app.hub.publish("state", None)
+        self._json({"ok": True})
+
+    @route("GET", "/api/java")
+    def list_java(self, query) -> None:
+        found = [{"path": c, "major": java.probe(c)} for c in java.candidates()]
+        self._json([f for f in found if f["major"]])
+
+    @route("POST", "/api/open-data-dir")
+    def open_data_dir(self, query) -> None:
+        folder = paths.root()
+        if sys.platform == "win32":
+            os.startfile(folder)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+        self._json({"ok": True})
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# Inicialização
+# ---------------------------------------------------------------------------
+
+def _app_browser() -> str | None:
+    """Encontra um navegador Chromium para abrir a interface como janela de app."""
+    names = ["msedge", "chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+             "brave-browser", "brave"]
+    for name in names:
+        path = shutil.which(name)
+        if path:
+            return path
+    if sys.platform == "win32":
+        for base in (os.environ.get("ProgramFiles(x86)", ""), os.environ.get("ProgramFiles", ""),
+                     os.environ.get("LOCALAPPDATA", "")):
+            for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe",
+                        r"BraveSoftware\Brave-Browser\Application\brave.exe"):
+                p = Path(base) / rel
+                if base and p.is_file():
+                    return str(p)
+    if sys.platform == "darwin":
+        for p in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                  "/Applications/Chromium.app/Contents/MacOS/Chromium"):
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def serve(port: int = 0) -> tuple[ThreadingHTTPServer, App]:
     app = App()
-    app.mainloop()
+    handler = type("BoundHandler", (Handler,), {"app": app})
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server.daemon_threads = True
+    handler.port = server.server_address[1]
+    return server, app
+
+
+def main(open_window: bool = True, port: int = 0) -> int:
+    server, app = serve(port)
+    url = f"http://127.0.0.1:{server.server_address[1]}/#t={app.token}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"PackLauncher {__version__} rodando em {url}")
+    print("Feche a janela do launcher (ou Ctrl+C) para sair.")
+
+    window = None
+    if open_window:
+        browser = _app_browser()
+        if browser:
+            profile = paths.root() / "ui-profile"
+            window = subprocess.Popen([browser, f"--app={url}", f"--user-data-dir={profile}",
+                                       "--window-size=1280,800", "--no-first-run",
+                                       "--no-default-browser-check"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            webbrowser.open(url)
+    try:
+        started = time.time()
+        if window:
+            window.wait()
+        if not window or time.time() - started < 5:
+            # Sem janela própria (ou o navegador repassou a janela a um processo já aberto):
+            # encerra quando nenhuma aba estiver conectada por 20s
+            while True:
+                time.sleep(2)
+                idle = not app.hub.clients and time.time() - app.hub.last_disconnect > 20
+                if open_window and idle and not app.running:
+                    break
+        while app.running:  # não derruba jogos abertos (a saída deles passa pelo launcher)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
+    server.shutdown()
     return 0

@@ -174,7 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("gui", help="abre a interface gráfica")
-    s.set_defaults(func=lambda a: __import__("packlauncher.gui", fromlist=["main"]).main())
+    s.add_argument("--port", type=int, default=0, help="porta local (padrão: aleatória)")
+    s.add_argument("--no-window", action="store_true", help="só inicia o servidor e mostra a URL")
+    s.set_defaults(func=lambda a: __import__("packlauncher.gui", fromlist=["main"])
+                   .main(open_window=not a.no_window, port=a.port))
 
     s = sub.add_parser("search", help="busca modpacks no Modrinth")
     s.add_argument("query", nargs="?", default="")

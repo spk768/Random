@@ -191,8 +191,11 @@ def install_pack(project: str, version_id: str | None = None, name: str | None =
     mrpack = download_pack_version(version, log)
     mc, loader, loader_version = pack_requirements(read_index(mrpack))
     inst = instances.create(name or proj["title"], mc, loader, loader_version)
+    gallery = proj.get("gallery") or []
+    banner = next((g["url"] for g in gallery if g.get("featured")), gallery[0]["url"] if gallery else None)
     inst.pack = {"source": "modrinth", "project_id": proj["id"], "slug": proj["slug"],
-                 "version_id": version["id"], "icon_url": proj.get("icon_url"), "files": []}
+                 "version_id": version["id"], "icon_url": proj.get("icon_url"),
+                 "banner_url": banner, "files": []}
     try:
         apply_mrpack(mrpack, inst, include_optional, log, progress)
     except Exception:

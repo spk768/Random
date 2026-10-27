@@ -15,3 +15,6 @@ packlauncher = "packlauncher.cli:main"
 
 [tool.setuptools]
 packages = ["packlauncher"]
+
+[tool.setuptools.package-data]
+packlauncher = ["web/*"]

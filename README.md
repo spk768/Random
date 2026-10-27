@@ -4,8 +4,17 @@ Launcher de Minecraft: Java Edition focado em **modpacks**. Busque, instale, atu
 e exporte modpacks do [Modrinth](https://modrinth.com) com um clique, sem precisar
 instalar loader, Java ou mods na mão.
 
-Escrito em Python puro (apenas biblioteca padrão), com interface gráfica em tkinter
-e uma CLI completa.
+Escrito em Python puro (apenas biblioteca padrão), com interface gráfica moderna no
+estilo do GD Launcher (tema escuro, biblioteca em cards, explorador de modpacks) e
+uma CLI completa.
+
+![Biblioteca](docs/biblioteca.png)
+
+| Instância | Explorar modpacks |
+|---|---|
+| ![Instância](docs/instancia.png) | ![Explorar](docs/explorar.png) |
+
+<sub>Screenshots com dados de demonstração.</sub>
 
 ## Recursos
 
@@ -33,8 +42,8 @@ e uma CLI completa.
 
 ## Instalação
 
-Requer Python 3.9+ com tkinter (já incluso no instalador oficial do Python para
-Windows/macOS; no Linux: `sudo apt install python3-tk`).
+Requer Python 3.9+. A interface abre como janela de aplicativo no Chrome, Edge,
+Brave ou Chromium (se nenhum estiver instalado, abre no navegador padrão).
 
 ```bash
 git clone https://github.com/spk768/random.git
@@ -49,12 +58,28 @@ python -m packlauncher   # abre a interface gráfica
 python -m packlauncher
 ```
 
-1. **👤 Contas** → adicione uma conta (offline ou Microsoft).
-2. **🔎 Buscar modpacks** → escolha um modpack e a versão → **Instalar**.
-3. Selecione a instância e clique em **▶ Jogar**.
+1. Clique na conta (canto superior direito) → adicione uma conta offline ou Microsoft.
+2. **Explorar modpacks** → escolha um modpack → selecione a versão → **Instalar**.
+   O progresso aparece na barra lateral e no card da instância.
+3. Na **Biblioteca**, passe o mouse sobre o card e clique em **▶**.
 
-No painel da instância: atualizar modpack, gerenciar mods, abrir pasta,
-configurações (memória, Java, argumentos JVM, resolução), exportar e excluir.
+Telas:
+
+- **Biblioteca**: cards com a arte do modpack, "Jogados recentemente", botão de
+  jogar direto no card, indicador de instância em execução.
+- **Instância**: cabeçalho com a arte do pack, botão Jogar/Fechar e abas
+  *Visão geral* (tempo de jogo, atualização do modpack, pastas), *Mods*
+  (ativar/desativar com interruptor, buscar, remover, adicionar do Modrinth),
+  *Logs* (saída do jogo em tempo real) e *Configurações* (memória, Java, JVM, resolução).
+  Menu **⋯**: duplicar, exportar `.mrpack`, excluir.
+- **Explorar**: busca no Modrinth com filtros de versão e loader; detalhes com galeria
+  e seleção de versão. A partir de uma instância, explora mods, resource packs e shaders
+  compatíveis.
+- **Adicionar instância**: personalizada (versão + loader), importar `.mrpack`
+  (ou arraste o arquivo para a janela) ou modpack do Modrinth.
+
+`python -m packlauncher gui --no-window` só inicia o servidor local e mostra a URL.
+A interface é servida apenas em `127.0.0.1` e protegida por um token aleatório.
 
 ## Linha de comando
 
